@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#061014">
+    <title>Cast to Chromecast - Media Baker</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #061014; color: #e7f7fa; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+      main { width: min(100%, 620px); padding: 28px; border: 1px solid #24424a; border-radius: 18px; background: #0c1a20; box-shadow: 0 24px 80px #0008; }
+      h1 { margin: 0 0 8px; font-size: clamp(1.5rem, 5vw, 2rem); }
+      p { color: #b7cbd0; line-height: 1.5; }
+      label { display: block; margin: 20px 0 8px; font-weight: 650; }
+      input, textarea { width: 100%; padding: 12px; color: inherit; background: #061014; border: 1px solid #35535b; border-radius: 8px; font: inherit; }
+      textarea { min-height: 110px; resize: vertical; overflow-wrap: anywhere; }
+      .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 18px; }
+      button, google-cast-launcher { min-height: 44px; border: 0; border-radius: 8px; padding: 10px 16px; font: inherit; font-weight: 700; }
+      button { color: #061014; background: #00d9ff; cursor: pointer; }
+      button:disabled { opacity: .55; cursor: not-allowed; }
+      google-cast-launcher { display: inline-flex; width: 52px; padding: 8px; background: #18343c; }
+      #status { min-height: 1.5em; margin: 18px 0 0; }
+      .note { font-size: .9rem; }
+      .error { color: #ff9a9a; }
+      .success { color: #88e2b6; }
+      @media (max-width: 520px) { main { padding: 20px; } }
+    </style>
+    <script>
+      window.__onGCastApiAvailable = function (available) {
+        window.dispatchEvent(new CustomEvent("media-baker-cast-api", { detail: { available } }));
+      };
+    </script>
+    <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Cast to Chromecast</h1>
+      <p>Paste a Media Baker copied playback URL, choose a Cast device, and send the HLS stream to it.</p>
+      <label for="mediaUrl">Playback URL</label>
+      <textarea id="mediaUrl" autocomplete="url" spellcheck="false" placeholder="https://your-server.example/api/streams/.../master.m3u8?playbackToken=..."></textarea>
+      <label for="mediaTitle">Title <span class="note">(optional)</span></label>
+      <input id="mediaTitle" type="text" maxlength="200" placeholder="Media title">
+      <div class="actions">
+        <button id="castNow" type="button">Choose device and cast</button>
+        <google-cast-launcher id="castLauncher" title="Choose a Chromecast device"></google-cast-launcher>
+      </div>
+      <p id="status" role="status" aria-live="polite">Enter a copied playback URL to begin.</p>
+      <p class="note">Playback URLs are bearer links: anyone who has one can play that item until its token expires. Keep them private. The Chromecast must be able to reach the URL; HTTPS is recommended.</p>
+    </main>
+    <script>
+      (() => {
+        const urlInput = document.getElementById("mediaUrl");
+        const titleInput = document.getElementById("mediaTitle");
+        const castButton = document.getElementById("castNow");
+        const status = document.getElementById("status");
+        let castAvailable = false;
+
+        function setStatus(message, kind = "") {
+          status.textContent = message;
+          status.className = kind;
+        }
+
+        function initializeCast(available) {
+          castAvailable = Boolean(available && window.cast && window.cast.framework);
+          castButton.disabled = !castAvailable;
+          if (!castAvailable) {
+            setStatus(location.protocol === "https:"
+              ? "Chromecast sender support is unavailable in this browser."
+              : "Chromecast requires this page to be served from HTTPS (or localhost).", "error");
+            return;
+          }
+          const context = cast.framework.CastContext.getInstance();
+          context.setOptions({
+            receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+            autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+          });
+          context.addEventListener(cast.framework.CastContextEventType.CAST_STATE_CHANGED, (event) => {
+            if (event.castState === cast.framework.CastState.NO_DEVICES_AVAILABLE) {
+              setStatus("No Cast devices are currently available. Check the device and try again.");
+            }
+          });
+          castButton.disabled = false;
+          setStatus("Ready. Enter a copied playback URL and choose a device.");
+        }
+
+        window.addEventListener("media-baker-cast-api", (event) => initializeCast(event.detail.available), { once: true });
+        if (window.cast && window.cast.framework) initializeCast(true);
+        const params = new URLSearchParams(location.search);
+        const suppliedUrl = params.get("url");
+        if (suppliedUrl) urlInput.value = suppliedUrl;
+        const suppliedTitle = params.get("title");
+        if (suppliedTitle) titleInput.value = suppliedTitle;
+
+        castButton.addEventListener("click", async () => {
+          if (!castAvailable) return;
+          let mediaUrl;
+          try {
+            mediaUrl = new URL(urlInput.value.trim());
+          } catch {
+            setStatus("Enter a valid absolute playback URL.", "error");
+            return;
+          }
+          if (!["http:", "https:"].includes(mediaUrl.protocol) || mediaUrl.username || mediaUrl.password) {
+            setStatus("Playback URL must use HTTP or HTTPS and must not contain embedded credentials.", "error");
+            return;
+          }
+          if (!/\.m3u8(?:$|\/)/i.test(mediaUrl.pathname)) {
+            setStatus("This Cast page currently accepts HLS (.m3u8) playback URLs.", "error");
+            return;
+          }
+
+          castButton.disabled = true;
+          setStatus("Connecting to the Cast device...");
+          try {
+            const context = cast.framework.CastContext.getInstance();
+            let session = context.getCurrentSession();
+            if (!session) {
+              await context.requestSession();
+              session = context.getCurrentSession();
+            }
+            if (!session) throw new Error("No Cast session was started.");
+
+            const info = new chrome.cast.media.MediaInfo(mediaUrl.toString(), "application/x-mpegURL");
+            info.streamType = chrome.cast.media.StreamType.BUFFERED;
+            info.metadata = new chrome.cast.media.GenericMediaMetadata();
+            info.metadata.title = titleInput.value.trim() || "Media Baker playback";
+            const request = new chrome.cast.media.LoadRequest(info);
+            await session.loadMedia(request);
+            setStatus("Playback sent to Chromecast.", "success");
+          } catch (error) {
+            setStatus(error && error.message ? `Could not start Cast playback: ${error.message}` : "Could not start Cast playback.", "error");
+          } finally {
+            castButton.disabled = false;
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>
